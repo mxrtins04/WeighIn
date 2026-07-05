@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import { execSync } from 'child_process';
 import { runMeasurement } from './measurement';
 
@@ -11,25 +10,53 @@ function getGitCommit(): string {
   }
 }
 
-async function main() {
+function parseArgs(): { fixturesPath: string; outputPath: string; rpcUrl: string } {
   const args = process.argv.slice(2);
-  const fixturesPath = args[0] || 'weighin-fixtures.json';
-  const outputPath = args[1] || 'weighin-results.json';
+  let fixturesPath = 'weighin-fixtures.json';
+  let outputPath = 'weighin-results.json';
+  let rpcUrl = 'http://localhost:8000/rpc';
 
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--rpc-url' && args[i + 1]) {
+      rpcUrl = args[++i];
+    } else if (args[i] === '--output' && args[i + 1]) {
+      outputPath = args[++i];
+    } else if (!args[i].startsWith('--')) {
+      // Positional: first is fixtures path, second is output path
+      if (fixturesPath === 'weighin-fixtures.json') {
+        fixturesPath = args[i];
+      } else {
+        outputPath = args[i];
+      }
+    }
+  }
+
+  return { fixturesPath, outputPath, rpcUrl };
+}
+
+async function main() {
+  const { fixturesPath, outputPath, rpcUrl } = parseArgs();
   const gitCommit = getGitCommit();
-  // Default to Soroban SDK version 21.2.0 (as used in scratch/contract_test)
-  const sdkVersion = '21.2.0';
+
+  // Best-effort: read soroban-sdk version from contract/Cargo.lock if present
+  let sdkVersion = 'unknown';
+  try {
+    const lock = fs.readFileSync('contract/Cargo.lock', 'utf8');
+    const m = lock.match(/name = "soroban-sdk"\nversion = "([^"]+)"/);
+    if (m) sdkVersion = m[1];
+  } catch { /* ignore */ }
 
   console.log(`Starting Weighin Benchmarking...`);
-  console.log(`Fixtures configuration: ${fixturesPath}`);
-  console.log(`Output results target: ${outputPath}`);
-  console.log(`Git Commit: ${gitCommit}`);
-  console.log(`Soroban SDK Version: ${sdkVersion}`);
+  console.log(`Fixtures: ${fixturesPath}`);
+  console.log(`Output:   ${outputPath}`);
+  console.log(`RPC URL:  ${rpcUrl}`);
+  console.log(`Commit:   ${gitCommit}`);
+  console.log(`SDK:      ${sdkVersion}`);
 
   try {
-    const results = await runMeasurement(fixturesPath, gitCommit, sdkVersion);
+    const results = await runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl);
     fs.writeFileSync(outputPath, JSON.stringify(results, null, 2), 'utf8');
-    console.log(`Benchmarking completed successfully! Results written to ${outputPath}`);
+    console.log(`Done. Results written to ${outputPath}`);
   } catch (error: any) {
     console.error(`Benchmarking failed:`, error);
     process.exit(1);

@@ -208,9 +208,10 @@ async function getInstanceSize(
 export async function runMeasurement(
   fixturesPath: string,
   gitCommit: string,
-  sdkVersion: string
+  sdkVersion: string,
+  rpcUrl: string = RPC_URL
 ): Promise<ContractBenchmark[]> {
-  const server = new rpc.Server(RPC_URL, { allowHttp: true });
+  const server = new rpc.Server(rpcUrl, { allowHttp: true });
   const deployer = await getOrInitAccount(server);
   const deployerAddress = Address.fromString(deployer.publicKey());
 
@@ -375,19 +376,26 @@ export async function runMeasurement(
       // D. Historical Read Bytes (Historical storage reads are not metered during simulation; always 0)
       const historicalReadBytes = 0;
 
-      // Map to Metrics (includes consumed and local/network default limits)
+      // Limits sourced from live network config (protocol 25, standalone).
+      // configSettingContractComputeV0:    txMaxInstructions=100_000_000, txMemoryLimit=41_943_040
+      // configSettingContractLedgerCostV0: txMaxReadLedgerEntries=100, txMaxReadBytes=200_000,
+      //                                    txMaxWriteLedgerEntries=50, txMaxWriteBytes=132_096
+      // configSettingContractBandwidthV0:  txMaxSizeBytes=132_096
+      // configSettingContractEventsV0:     txMaxContractEventsSizeBytes=16_384
+      // configSettingContractDataEntrySizeBytes: 65_536
+      // historical_data_read_bytes: no size limit in config (fee-only); tracked as known gap.
       const metrics: Metrics = {
-        cpu_instructions: { consumed: cpuConsumed, limit: 100000000 },
-        memory_bytes: { consumed: memConsumed, limit: 41943040 },
-        ledger_read_entries: { consumed: readEntries, limit: 40 },
-        ledger_read_bytes: { consumed: readBytes, limit: 2097152 },
-        ledger_write_entries: { consumed: writeEntries, limit: 32 },
-        ledger_write_bytes: { consumed: writeBytes, limit: 1048576 },
-        historical_data_read_bytes: { consumed: historicalReadBytes, limit: 4194304 },
-        contract_data_hard_limit: { consumed: contractDataHardLimit, limit: 65536 }, // 64KB hard limit for instance data
-        tx_size_bytes: { consumed: txSizeBytes, limit: 71680 },
-        events_count: { consumed: eventsCount, limit: 100 },
-        event_data_bytes: { consumed: eventBytes, limit: 10240 },
+        cpu_instructions:           { consumed: cpuConsumed,            limit: 100_000_000 },
+        memory_bytes:               { consumed: memConsumed,            limit: 41_943_040 },
+        ledger_read_entries:        { consumed: readEntries,            limit: 100 },
+        ledger_read_bytes:          { consumed: readBytes,              limit: 200_000 },
+        ledger_write_entries:       { consumed: writeEntries,           limit: 50 },
+        ledger_write_bytes:         { consumed: writeBytes,             limit: 132_096 },
+        historical_data_read_bytes: { consumed: historicalReadBytes,    limit: 0 }, // TODO: no size limit in config; fee-only
+        contract_data_hard_limit:   { consumed: contractDataHardLimit,  limit: 65_536 },
+        tx_size_bytes:              { consumed: txSizeBytes,            limit: 132_096 },
+        events_count:               { consumed: eventsCount,            limit: 100 },
+        event_data_bytes:           { consumed: eventBytes,             limit: 16_384 },
       };
 
       benchmarks.push({

@@ -1,0 +1,67 @@
+name: 'WeighIn'
+description: 'Measure and diff Soroban contract resource costs on pull requests'
+author: 'Ijioma Makwochukwu'
+
+inputs:
+  fixtures-path:
+    description: >
+      Path to the weighin-fixtures.json file in the caller repo, relative to the
+      repository root. Declares which WASM files to benchmark and which functions
+      to invoke.
+    required: true
+    default: 'weighin-fixtures.json'
+
+  config-path:
+    description: >
+      Path to the weighin.toml threshold configuration file, relative to the
+      repository root. If the file does not exist the action runs without
+      enforcing any regression rules.
+    required: false
+    default: 'weighin.toml'
+
+  rpc-url:
+    description: >
+      Soroban RPC endpoint to use for simulation. Defaults to the
+      stellar/quickstart local network started by the action's pre-step.
+      Override this if you bring your own RPC sidecar.
+    required: false
+    default: 'http://localhost:8000/rpc'
+
+  github-token:
+    description: >
+      GitHub token used to post the benchmark diff comment on the pull request.
+      Pass secrets.GITHUB_TOKEN. If omitted, the PR comment step is skipped.
+    required: false
+    default: ''
+
+  base-ref:
+    description: >
+      Git ref to use as the baseline for comparison. Defaults to the PR base
+      branch (github.base_ref). Override for manual dispatch or scheduled runs.
+    required: false
+    default: ''
+
+  rust-toolchain:
+    description: >
+      Rust toolchain channel to use when building WASM. Defaults to the value
+      in rust-toolchain.toml if present, otherwise 'stable'. The action does
+      not install toolchains itself; callers must run actions/rust-toolchain or
+      dtolnay/rust-toolchain before this action.
+    required: false
+    default: ''
+
+outputs:
+  result:
+    description: >
+      'pass' if no thresholds were violated, 'fail' if at least one regression
+      was detected, or 'no-baseline' if the base ref could not be checked out
+      or built (first PR against an empty branch, etc.).
+
+  diff-json:
+    description: >
+      JSON string containing the full diff result. Useful for downstream steps
+      that want to process the numbers without parsing the PR comment.
+
+runs:
+  using: 'node20'
+  main: 'dist/action.js'
