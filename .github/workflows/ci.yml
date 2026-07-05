@@ -1,0 +1,46 @@
+name: WeighIn CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  benchmark:
+    name: Soroban Resource Benchmark
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write   # needed to post/update the PR comment
+      contents: read
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          # Full history needed so git worktree add can fetch the base ref
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Pin to the same channel declared in rust-toolchain.toml
+          toolchain: "1.95.0"
+          targets: wasm32-unknown-unknown
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Start local Stellar network
+        run: bash scripts/start-local-network.sh
+
+      - name: Run WeighIn
+        uses: ./   # use the action from this repo's own checkout
+        with:
+          fixtures-path: weighin-fixtures.json
+          config-path: weighin.toml
+          rpc-url: http://localhost:8000/rpc
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # base-ref is inferred from the pull_request event automatically

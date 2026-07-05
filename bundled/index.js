@@ -36129,61 +36129,89 @@ const diff_1 = __nccwpck_require__(9952);
 const threshold_1 = __nccwpck_require__(852);
 const comment_1 = __nccwpck_require__(2246);
 // ---------------------------------------------------------------------------
-// Helpers
+// RPC health check
 // ---------------------------------------------------------------------------
 /**
- * Run a shell command through @actions/exec, capturing stdout.
- * Throws on non-zero exit.
+ * Verify that the RPC endpoint is reachable and responding to getNetwork.
+ * Fails the action with a clear message if not — the caller is responsible
+ * for starting the network before invoking this action.
  */
+async function assertRpcHealthy(rpcUrl) {
+    core.info(`Checking RPC health at ${rpcUrl} ...`);
+    try {
+        const res = await fetch(rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getNetwork' }),
+            signal: AbortSignal.timeout(10_000),
+        });
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status} ${res.statusText}`);
+        }
+        const json = await res.json();
+        if (json.error) {
+            throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
+        }
+        core.info(`RPC healthy — network: ${json.result?.passphrase ?? '(no passphrase)'}`);
+    }
+    catch (err) {
+        core.setFailed(`Soroban RPC at ${rpcUrl} is not reachable: ${err.message}\n` +
+            `Start the network before invoking this action (e.g. via stellar/quickstart ` +
+            `or scripts/start-local-network.sh), then pass its URL as the rpc-url input.`);
+        throw err; // halt execution
+    }
+}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+/** Run a command and capture stdout. Throws on non-zero exit. */
 async function capture(cmd, args, cwd) {
     let out = '';
     await exec.exec(cmd, args, {
         cwd,
-        listeners: {
-            stdout: (data) => { out += data.toString(); },
-        },
+        listeners: { stdout: (d) => { out += d.toString(); } },
         silent: true,
     });
     return out.trim();
 }
-/** Get the current HEAD SHA in cwd. */
-async function getHeadSha(cwd) {
+/** Get HEAD SHA in the given directory. */
+async function getHeadSha(dir) {
     try {
-        return await capture('git', ['rev-parse', 'HEAD'], cwd);
+        return await capture('git', ['rev-parse', 'HEAD'], dir);
     }
     catch {
         return 'unknown';
     }
 }
-/** Get the default Soroban SDK version by parsing cargo metadata (best-effort). */
-function getSdkVersion(cwd) {
-    try {
-        const lockPath = path.join(cwd, 'contract', 'Cargo.lock');
-        if (fs.existsSync(lockPath)) {
-            const lock = fs.readFileSync(lockPath, 'utf8');
-            const m = lock.match(/name = "soroban-sdk"\nversion = "([^"]+)"/);
-            if (m)
-                return m[1];
+/** Read soroban-sdk version from Cargo.lock (best-effort). */
+function getSdkVersion(repoDir) {
+    // Try common locations: repo root Cargo.lock, or contract/Cargo.lock
+    for (const rel of ['Cargo.lock', 'contract/Cargo.lock']) {
+        const lockPath = path.join(repoDir, rel);
+        try {
+            if (fs.existsSync(lockPath)) {
+                const lock = fs.readFileSync(lockPath, 'utf8');
+                const m = lock.match(/name = "soroban-sdk"\nversion = "([^"]+)"/);
+                if (m)
+                    return m[1];
+            }
         }
+        catch { /* ignore */ }
     }
-    catch { /* ignore */ }
     return 'unknown';
 }
 /**
  * Build all WASM contracts declared in the fixtures file.
- *
- * The fixtures file references wasm_path values relative to the repo root.
- * For each unique directory that contains a Cargo.toml, we run:
- *   cargo build --release --target wasm32-unknown-unknown
+ * wasm_path entries are relative to the fixtures file's directory.
+ * Walks up from each wasm_path to find the owning Cargo.toml workspace/crate.
  */
-async function buildContracts(fixturesPath, repoRoot) {
+async function buildContracts(fixturesPath) {
+    const fixturesDir = path.dirname(path.resolve(fixturesPath));
     const raw = fs.readFileSync(fixturesPath, 'utf8');
     const fixtures = JSON.parse(raw);
-    // Collect unique Cargo.toml directories
     const cargoDirs = new Set();
     for (const contract of fixtures.contracts) {
-        const wasmAbs = path.resolve(repoRoot, contract.wasm_path);
-        // Walk up from the wasm_path to find the first Cargo.toml
+        const wasmAbs = path.resolve(fixturesDir, contract.wasm_path);
         let dir = path.dirname(wasmAbs);
         while (dir !== path.dirname(dir)) {
             if (fs.existsSync(path.join(dir, 'Cargo.toml'))) {
@@ -36193,9 +36221,43 @@ async function buildContracts(fixturesPath, repoRoot) {
             dir = path.dirname(dir);
         }
     }
+    if (cargoDirs.size === 0) {
+        throw new Error(`No Cargo.toml found for any wasm_path in ${fixturesPath}`);
+    }
     for (const dir of cargoDirs) {
-        core.info(`Building WASM in ${dir} ...`);
+        core.info(`cargo build --release --target wasm32-unknown-unknown in ${dir}`);
         await exec.exec('cargo', ['build', '--release', '--target', 'wasm32-unknown-unknown'], { cwd: dir });
+    }
+}
+// ---------------------------------------------------------------------------
+// Two-directory checkout
+// ---------------------------------------------------------------------------
+/**
+ * Check out a git ref into a fresh temporary directory using a bare clone
+ * of the repository that is already checked out at repoRoot.
+ *
+ * Returns the path to the new directory and the resolved SHA.
+ */
+async function checkoutRef(repoRoot, ref, label) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `weighin-${label}-`));
+    core.info(`Checking out ${ref} into ${dir}`);
+    // Fetch the ref into the existing repo's object store, then use
+    // git worktree add to get a clean directory without touching the
+    // main workspace.
+    await exec.exec('git', ['fetch', '--depth=1', 'origin', ref], { cwd: repoRoot });
+    await exec.exec('git', ['worktree', 'add', '--detach', dir, `origin/${ref}`], { cwd: repoRoot });
+    const sha = await getHeadSha(dir);
+    core.info(`${label} SHA: ${sha}`);
+    return { dir, sha };
+}
+/** Remove a worktree directory created by checkoutRef. */
+async function removeWorktree(repoRoot, dir) {
+    try {
+        await exec.exec('git', ['worktree', 'remove', '--force', dir], { cwd: repoRoot });
+    }
+    catch {
+        // Non-fatal; runner will clean up temp dirs anyway
+        core.warning(`Could not remove git worktree at ${dir}`);
     }
 }
 // ---------------------------------------------------------------------------
@@ -36207,32 +36269,19 @@ async function upsertPrComment(token, body) {
     const { owner, repo } = github.context.repo;
     const prNumber = github.context.payload.pull_request?.number;
     if (!prNumber) {
-        core.warning('Not running in a pull_request context; skipping PR comment.');
+        core.warning('Not in a pull_request context; skipping PR comment.');
         return;
     }
-    // Look for an existing weighin comment to update
     const { data: comments } = await octokit.rest.issues.listComments({
-        owner,
-        repo,
-        issue_number: prNumber,
+        owner, repo, issue_number: prNumber,
     });
     const existing = comments.find((c) => c.body?.includes(COMMENT_MARKER));
     if (existing) {
-        await octokit.rest.issues.updateComment({
-            owner,
-            repo,
-            comment_id: existing.id,
-            body,
-        });
-        core.info(`Updated existing PR comment #${existing.id}`);
+        await octokit.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+        core.info(`Updated PR comment #${existing.id}`);
     }
     else {
-        await octokit.rest.issues.createComment({
-            owner,
-            repo,
-            issue_number: prNumber,
-            body,
-        });
+        await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
         core.info('Created new PR comment');
     }
 }
@@ -36240,82 +36289,101 @@ async function upsertPrComment(token, body) {
 // Main
 // ---------------------------------------------------------------------------
 async function run() {
-    // --- Read inputs ---
     const fixturesPathRel = core.getInput('fixtures-path', { required: true });
     const configPathRel = core.getInput('config-path');
-    const rpcUrl = core.getInput('rpc-url');
+    const rpcUrl = core.getInput('rpc-url') || 'http://localhost:8000/rpc';
     const githubToken = core.getInput('github-token');
     const baseRefInput = core.getInput('base-ref');
-    // Determine working directory (the caller's repo root)
-    const repoRoot = process.env['GITHUB_WORKSPACE'] ?? process.cwd();
-    const fixturesPath = path.resolve(repoRoot, fixturesPathRel);
-    const configPath = path.resolve(repoRoot, configPathRel || 'weighin.toml');
-    if (!fs.existsSync(fixturesPath)) {
-        core.setFailed(`fixtures-path not found: ${fixturesPath}`);
-        return;
-    }
-    // Determine base ref
+    // The runner's checkout of the PR head is at GITHUB_WORKSPACE
+    const headWorkspace = process.env['GITHUB_WORKSPACE'] ?? process.cwd();
     const baseRef = baseRefInput
         || github.context.payload.pull_request?.base?.ref
         || 'main';
-    core.info(`Base ref: ${baseRef}`);
-    core.info(`Fixtures: ${fixturesPath}`);
-    core.info(`Config:   ${configPath}`);
-    core.info(`RPC URL:  ${rpcUrl}`);
-    // --- Measure HEAD (current checkout) ---
-    core.startGroup('Measuring HEAD');
-    const headSha = await getHeadSha(repoRoot);
+    // Key file lives outside either worktree so both measurements share it
+    const sharedKeyFile = path.join(os.tmpdir(), 'weighin-deployer.key');
+    core.info(`Base ref:   ${baseRef}`);
+    core.info(`RPC URL:    ${rpcUrl}`);
+    core.info(`Fixtures:   ${fixturesPathRel}`);
+    core.info(`Key file:   ${sharedKeyFile}`);
+    // 1. RPC health check — fail fast with a clear message
+    await assertRpcHealthy(rpcUrl);
+    // 2. Resolve paths from the HEAD workspace (fixtures, config live there)
+    const headFixturesPath = path.resolve(headWorkspace, fixturesPathRel);
+    const configPath = path.resolve(headWorkspace, configPathRel || 'weighin.toml');
+    if (!fs.existsSync(headFixturesPath)) {
+        core.setFailed(`fixtures-path not found: ${headFixturesPath}`);
+        return;
+    }
+    // 3. Measure HEAD (the PR branch — already checked out at headWorkspace)
+    core.startGroup('Building + measuring HEAD');
+    const headSha = await getHeadSha(headWorkspace);
     core.info(`HEAD SHA: ${headSha}`);
     let headResults;
     try {
-        await buildContracts(fixturesPath, repoRoot);
-        headResults = await (0, measurement_1.runMeasurement)(fixturesPath, headSha, getSdkVersion(repoRoot), rpcUrl);
+        await buildContracts(headFixturesPath);
+        headResults = await (0, measurement_1.runMeasurement)({
+            fixturesPath: headFixturesPath,
+            gitCommit: headSha,
+            sdkVersion: getSdkVersion(headWorkspace),
+            rpcUrl,
+            keyFile: sharedKeyFile,
+        });
     }
     catch (err) {
         core.setFailed(`HEAD measurement failed: ${err.message}`);
         return;
     }
     core.endGroup();
-    // --- Check out base ref and measure baseline ---
-    core.startGroup(`Measuring base (${baseRef})`);
-    // Stash the head results path so we can restore the workspace
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'weighin-'));
-    const headResultsPath = path.join(tmpDir, 'head.json');
-    fs.writeFileSync(headResultsPath, JSON.stringify(headResults, null, 2));
+    // Log WASM hashes from HEAD for the determinism audit trail
+    for (const contract of headResults) {
+        for (const bench of contract.benchmarks) {
+            core.info(`[HEAD] WASM SHA256 (${bench.function_name}): ${bench.wasm_sha256}`);
+        }
+    }
+    // 4. Check out base ref into a separate worktree — never touch headWorkspace
+    core.startGroup(`Building + measuring base (${baseRef})`);
     let baseResults = null;
+    let baseDir = null;
     let baseSha = 'unknown';
     try {
-        // Fetch and check out the base branch without switching the whole workspace
-        await exec.exec('git', ['fetch', '--depth=1', 'origin', baseRef], { cwd: repoRoot });
-        await exec.exec('git', ['stash'], { cwd: repoRoot });
-        try {
-            await exec.exec('git', ['checkout', `origin/${baseRef}`], { cwd: repoRoot });
-            baseSha = await getHeadSha(repoRoot);
-            core.info(`Base SHA: ${baseSha}`);
-            await buildContracts(fixturesPath, repoRoot);
-            baseResults = await (0, measurement_1.runMeasurement)(fixturesPath, baseSha, getSdkVersion(repoRoot), rpcUrl);
+        const checkout = await checkoutRef(headWorkspace, baseRef, 'base');
+        baseDir = checkout.dir;
+        baseSha = checkout.sha;
+        // The fixtures file in the base worktree — same relative path
+        const baseFixturesPath = path.resolve(baseDir, fixturesPathRel);
+        if (!fs.existsSync(baseFixturesPath)) {
+            core.warning(`fixtures-path not found in base ref; skipping baseline.`);
         }
-        finally {
-            // Always restore the HEAD workspace
-            await exec.exec('git', ['checkout', '-'], { cwd: repoRoot });
-            await exec.exec('git', ['stash', 'pop'], { cwd: repoRoot }).catch(() => {
-                // stash pop can fail if there was nothing stashed or conflicts; non-fatal
-                core.warning('git stash pop did not cleanly restore; the workspace may need attention');
+        else {
+            await buildContracts(baseFixturesPath);
+            baseResults = await (0, measurement_1.runMeasurement)({
+                fixturesPath: baseFixturesPath,
+                gitCommit: baseSha,
+                sdkVersion: getSdkVersion(baseDir),
+                rpcUrl,
+                keyFile: sharedKeyFile,
             });
+            // Log WASM hashes from base
+            for (const contract of baseResults) {
+                for (const bench of contract.benchmarks) {
+                    core.info(`[BASE] WASM SHA256 (${bench.function_name}): ${bench.wasm_sha256}`);
+                }
+            }
         }
     }
     catch (err) {
-        core.warning(`Base measurement failed (${err.message}); reporting head-only, no diff.`);
+        core.warning(`Base measurement failed (${err.message}); reporting head-only.`);
+    }
+    finally {
+        if (baseDir)
+            await removeWorktree(headWorkspace, baseDir);
     }
     core.endGroup();
-    // --- Restore head results from file ---
-    headResults = JSON.parse(fs.readFileSync(headResultsPath, 'utf8'));
-    // --- If no base, emit head-only output and exit pass ---
+    // 5. No-baseline path (first PR, base build failed, etc.)
     if (!baseResults) {
-        const headJson = JSON.stringify(headResults, null, 2);
         core.setOutput('result', 'no-baseline');
         core.setOutput('diff-json', '{}');
-        core.info('No baseline available; emitting head measurements only.');
+        core.info('No baseline; emitting head-only measurements.');
         if (githubToken) {
             const body = [
                 '## ⚪ WeighIn Benchmark Report',
@@ -36323,34 +36391,40 @@ async function run() {
                 'No baseline available for comparison. Head measurements recorded.',
                 '',
                 '```json',
-                headJson,
+                JSON.stringify(headResults, null, 2),
                 '```',
                 '',
                 COMMENT_MARKER,
             ].join('\n');
-            await upsertPrComment(githubToken, body);
+            await upsertPrComment(githubToken, body).catch((e) => core.warning(`PR comment failed: ${e.message}`));
         }
         return;
     }
-    // --- Diff ---
+    // 6. Diff
     core.startGroup('Computing diff');
     const diff = (0, diff_1.diffBenchmarks)(baseResults, headResults);
-    core.info(`Regression detected: ${diff.hasRegression}`);
+    core.info(`Any regression: ${diff.hasRegression}`);
     core.endGroup();
-    // --- Threshold enforcement ---
+    // 7. Threshold enforcement
     core.startGroup('Enforcing thresholds');
     const config = (0, threshold_1.loadConfig)(configPath);
+    if (config) {
+        core.info('weighin.toml loaded');
+    }
+    else {
+        core.info('No weighin.toml found — no thresholds enforced');
+    }
     const violations = (0, threshold_1.enforceThresholds)(diff, config);
     core.info(`Violations: ${violations.length}`);
     for (const v of violations) {
         core.error(`[${v.function_name}] ${v.message}`);
     }
     core.endGroup();
-    // --- Outputs ---
+    // 8. Outputs
     const result = violations.length > 0 ? 'fail' : 'pass';
     core.setOutput('result', result);
     core.setOutput('diff-json', JSON.stringify(diff));
-    // --- PR comment ---
+    // 9. PR comment
     if (githubToken) {
         core.startGroup('Posting PR comment');
         try {
@@ -36358,12 +36432,11 @@ async function run() {
             await upsertPrComment(githubToken, body);
         }
         catch (err) {
-            // Comment failure is non-fatal; don't mask the real result
             core.warning(`Failed to post PR comment: ${err.message}`);
         }
         core.endGroup();
     }
-    // --- Exit status ---
+    // 10. Exit status
     if (violations.length > 0) {
         core.setFailed(`${violations.length} threshold violation(s) detected`);
     }
@@ -36659,11 +36732,22 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.runMeasurement = runMeasurement;
 const fs = __importStar(__nccwpck_require__(9896));
+const path = __importStar(__nccwpck_require__(6928));
 const crypto = __importStar(__nccwpck_require__(6982));
 const stellar_sdk_1 = __nccwpck_require__(2878);
-const RPC_URL = 'http://localhost:8000/rpc';
+const DEFAULT_RPC_URL = 'http://localhost:8000/rpc';
 const NETWORK_PASSPHRASE = 'Standalone Network ; February 2017';
-const TEMP_KEY_FILE = '.weighin-temp-key';
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+/** Derive the friendbot base URL from the RPC URL.
+ *  Strips a trailing /rpc segment and appends /friendbot.
+ *  e.g. http://localhost:8000/rpc -> http://localhost:8000/friendbot
+ */
+function friendbotUrl(rpcUrl, publicKey) {
+    const base = rpcUrl.replace(/\/rpc\/?$/, '');
+    return `${base}/friendbot?addr=${encodeURIComponent(publicKey)}`;
+}
 // Convert native type/value to ScVal
 function toScVal(arg) {
     const type = arg.type.toLowerCase();
@@ -36698,36 +36782,40 @@ function calculateContractId(deployerAddress, salt) {
     const contractIdBytes = (0, stellar_sdk_1.hash)(hashIdPreimage.toXDR());
     return stellar_sdk_1.StrKey.encodeContract(contractIdBytes);
 }
-// Load or generate/fund a keypair
-async function getOrInitAccount(server) {
-    let secret;
-    if (fs.existsSync(TEMP_KEY_FILE)) {
-        secret = fs.readFileSync(TEMP_KEY_FILE, 'utf8').trim();
+/**
+ * Load or generate a deployer keypair.
+ *
+ * @param keyFile  Absolute path to the key file. Shared between base and head
+ *                 runs so both measurements use the same on-chain account.
+ * @param rpcUrl   Used to derive the friendbot URL for initial funding.
+ */
+async function getOrInitAccount(server, keyFile, rpcUrl) {
+    if (fs.existsSync(keyFile)) {
+        const secret = fs.readFileSync(keyFile, 'utf8').trim();
         return stellar_sdk_1.Keypair.fromSecret(secret);
     }
     const keypair = stellar_sdk_1.Keypair.random();
-    secret = keypair.secret();
-    fs.writeFileSync(TEMP_KEY_FILE, secret, 'utf8');
-    console.log(`Funding temporary deployer account: ${keypair.publicKey()} ...`);
-    const friendbotUrl = `http://localhost:8000/friendbot?addr=${keypair.publicKey()}`;
-    const res = await fetch(friendbotUrl);
+    fs.writeFileSync(keyFile, keypair.secret(), { mode: 0o600 });
+    console.log(`Funding deployer account: ${keypair.publicKey()} via friendbot...`);
+    const url = friendbotUrl(rpcUrl, keypair.publicKey());
+    const res = await fetch(url);
     if (!res.ok) {
-        throw new Error(`Friendbot funding failed: ${res.statusText}`);
+        throw new Error(`Friendbot funding failed (${res.status}): ${res.statusText}`);
     }
     // Wait for ledger inclusion
     await new Promise((resolve) => setTimeout(resolve, 3000));
     return keypair;
 }
 // Poll transaction completion
-async function waitForTransaction(server, hash) {
+async function waitForTransaction(server, txHash) {
     for (let i = 0; i < 30; i++) {
-        const tx = await server.getTransaction(hash);
+        const tx = await server.getTransaction(txHash);
         if (tx.status !== 'NOT_FOUND') {
             return tx;
         }
         await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    throw new Error(`Transaction ${hash} not found after 30 seconds`);
+    throw new Error(`Transaction ${txHash} not found after 30 seconds`);
 }
 // Check if contract is already deployed
 async function isContractDeployed(server, contractId) {
@@ -36747,7 +36835,6 @@ async function isContractDeployed(server, contractId) {
 }
 // Measure instance size from stateChanges or fallback to getLedgerEntries
 async function getInstanceSize(server, contractId, stateChanges) {
-    // Try parsing from simulation stateChanges first
     if (stateChanges) {
         for (const change of stateChanges) {
             if (change.after) {
@@ -36763,7 +36850,6 @@ async function getInstanceSize(server, contractId, stateChanges) {
             }
         }
     }
-    // Fallback to querying the ledger directly
     try {
         const contractScAddress = stellar_sdk_1.Address.fromString(contractId).toScAddress();
         const ledgerKey = stellar_sdk_1.xdr.LedgerKey.contractData(new stellar_sdk_1.xdr.LedgerKeyContractData({
@@ -36779,27 +36865,47 @@ async function getInstanceSize(server, contractId, stateChanges) {
     catch { }
     return 0;
 }
-async function runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl = RPC_URL) {
-    const server = new stellar_sdk_1.rpc.Server(rpcUrl, { allowHttp: true });
-    const deployer = await getOrInitAccount(server);
+async function runMeasurement(fixturesPathOrOptions, gitCommit, sdkVersion, rpcUrl) {
+    // Support both the old positional signature and the new options object
+    let opts;
+    if (typeof fixturesPathOrOptions === 'string') {
+        opts = {
+            fixturesPath: fixturesPathOrOptions,
+            gitCommit: gitCommit ?? 'unknown',
+            sdkVersion: sdkVersion ?? 'unknown',
+            rpcUrl,
+        };
+    }
+    else {
+        opts = fixturesPathOrOptions;
+    }
+    const effectiveRpcUrl = opts.rpcUrl ?? DEFAULT_RPC_URL;
+    const fixturesDir = path.dirname(path.resolve(opts.fixturesPath));
+    const keyFile = opts.keyFile ?? path.join(fixturesDir, '.weighin-temp-key');
+    const server = new stellar_sdk_1.rpc.Server(effectiveRpcUrl, { allowHttp: true });
+    const deployer = await getOrInitAccount(server, keyFile, effectiveRpcUrl);
     const deployerAddress = stellar_sdk_1.Address.fromString(deployer.publicKey());
-    const rawFixtures = fs.readFileSync(fixturesPath, 'utf8');
+    const rawFixtures = fs.readFileSync(opts.fixturesPath, 'utf8');
     const fixturesSpec = JSON.parse(rawFixtures);
     const results = [];
     for (const contractSpec of fixturesSpec.contracts) {
-        const wasmPath = contractSpec.wasm_path;
+        // Resolve wasm_path relative to the fixtures file's directory
+        const wasmPath = path.resolve(fixturesDir, contractSpec.wasm_path);
         if (!fs.existsSync(wasmPath)) {
-            throw new Error(`WASM file not found at ${wasmPath}. Build the contract first!`);
+            throw new Error(`WASM not found: ${wasmPath}\nBuild the contract before running measurements.`);
         }
         const wasmBytes = fs.readFileSync(wasmPath);
         const wasmHash = crypto.createHash('sha256').update(wasmBytes).digest();
-        // Use deterministic salt based on WASM hash to avoid duplicate deployments
+        const wasmSha256 = wasmHash.toString('hex');
+        console.log(`WASM: ${wasmPath}`);
+        console.log(`WASM SHA256: ${wasmSha256}`);
+        // Deterministic salt based on WASM hash — same WASM always gets same contract ID
         const salt = crypto.createHash('sha256').update(wasmHash).digest();
         const contractId = calculateContractId(deployer.publicKey(), salt);
-        console.log(`Checking deployment status of contract: ${contractId} (WASM: ${wasmPath})`);
+        console.log(`Contract ID: ${contractId}`);
         const deployed = await isContractDeployed(server, contractId);
         if (!deployed) {
-            console.log(`Contract not deployed. Installing Wasm...`);
+            console.log(`Installing WASM...`);
             let account = await server.getAccount(deployer.publicKey());
             // 1. Upload WASM
             const uploadTx = new stellar_sdk_1.TransactionBuilder(account, {
@@ -36809,19 +36915,16 @@ async function runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl = RPC_
                 .addOperation(stellar_sdk_1.Operation.uploadContractWasm({ wasm: wasmBytes }))
                 .setTimeout(30)
                 .build();
-            console.log("Simulating Wasm upload transaction...");
-            const simUpload = await server.simulateTransaction(uploadTx);
-            console.log("Upload Simulation Result:", JSON.stringify(simUpload, null, 2));
             const preparedUpload = await server.prepareTransaction(uploadTx);
             preparedUpload.sign(deployer);
             const uploadSend = await server.sendTransaction(preparedUpload);
             const uploadRes = await waitForTransaction(server, uploadSend.hash);
             if (uploadRes.status !== stellar_sdk_1.rpc.Api.GetTransactionStatus.SUCCESS) {
-                throw new Error(`Wasm upload failed: ${JSON.stringify(uploadRes)}`);
+                throw new Error(`WASM upload failed: ${JSON.stringify(uploadRes)}`);
             }
-            console.log(`Wasm installed successfully. Deploying contract instance...`);
+            console.log(`WASM installed. Deploying contract instance...`);
             account = await server.getAccount(deployer.publicKey());
-            // 2. Create Contract Instance
+            // 2. Create contract instance
             const createTx = new stellar_sdk_1.TransactionBuilder(account, {
                 fee: '1000000',
                 networkPassphrase: NETWORK_PASSPHRASE,
@@ -36838,17 +36941,17 @@ async function runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl = RPC_
             const createSend = await server.sendTransaction(preparedCreate);
             const createRes = await waitForTransaction(server, createSend.hash);
             if (createRes.status !== stellar_sdk_1.rpc.Api.GetTransactionStatus.SUCCESS) {
-                throw new Error(`Contract instantiation failed: ${JSON.stringify(createRes)}`);
+                throw new Error(`Contract deploy failed: ${JSON.stringify(createRes)}`);
             }
-            console.log(`Contract deployed successfully at ID: ${contractId}`);
+            console.log(`Deployed at ${contractId}`);
         }
         else {
-            console.log(`Contract ${contractId} is already deployed.`);
+            console.log(`Already deployed at ${contractId}`);
         }
         const benchmarks = [];
-        // 3. Invoke/Simulate functions
+        // 3. Simulate invocations
         for (const invokeSpec of contractSpec.invocations) {
-            console.log(`Simulating call to function '${invokeSpec.function_name}'...`);
+            console.log(`Simulating ${invokeSpec.function_name}...`);
             const account = await server.getAccount(deployer.publicKey());
             const argsSc = invokeSpec.args.map(toScVal);
             const invokeTx = new stellar_sdk_1.TransactionBuilder(account, {
@@ -36864,11 +36967,9 @@ async function runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl = RPC_
                 .build();
             const simRes = await server.simulateTransaction(invokeTx);
             if (stellar_sdk_1.rpc.Api.isSimulationError(simRes)) {
-                throw new Error(`Simulation failed: ${simRes.error}`);
+                throw new Error(`Simulation failed for ${invokeSpec.function_name}: ${simRes.error}`);
             }
-            // Parse 11 Metrics
             const simSuccess = simRes;
-            // Extract SorobanTransactionData and footprint
             const transactionData = simSuccess.transactionData;
             const parsedData = transactionData.build();
             const resources = parsedData.resources();
@@ -36877,45 +36978,22 @@ async function runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl = RPC_
             const writeEntries = footprint.readWrite().length;
             const readBytes = resources.diskReadBytes();
             const writeBytes = resources.writeBytes();
-            // CPU and Memory limits
             const cpuConsumed = Number(simSuccess.cost.cpuInsns);
             const memConsumed = Number(simSuccess.cost.memBytes);
-            // Event Data and Count
             const eventsCount = simSuccess.events.length;
             const eventBytes = simSuccess.events.reduce((acc, e) => {
                 const event = e.event();
-                if (event.type().name !== 'contract') {
+                if (event.type().name !== 'contract')
                     return acc;
-                }
                 return acc + event.toXDR().length;
             }, simSuccess.result?.retval.toXDR().length || 0);
-            // 4 Unresolved Metrics
-            // A. Transaction Size Bytes
+            // Transaction size: prepare to get the fully-assembled envelope
             const preparedTx = await server.prepareTransaction(invokeTx);
             const txSizeBytes = Buffer.from(preparedTx.toEnvelope().toXDR()).length;
-            // B. Max Entry Bytes
-            // Parse sizes of all readWrite entries and readOnly entries to find the maximum
-            let maxEntryBytes = 0;
+            // Contract instance size
             const stateChanges = simSuccess.stateChanges || [];
-            for (const change of stateChanges) {
-                if (change.after) {
-                    maxEntryBytes = Math.max(maxEntryBytes, change.after.toXDR().length);
-                }
-            }
-            // If we need the maximum of read-only entries as well, query them
-            const readOnlyKeys = footprint.readOnly();
-            if (readOnlyKeys.length > 0) {
-                try {
-                    const res = await server.getLedgerEntries(...readOnlyKeys);
-                    for (const entry of res.entries) {
-                        maxEntryBytes = Math.max(maxEntryBytes, entry.val.toXDR().length);
-                    }
-                }
-                catch { }
-            }
-            // C. Contract Data Hard Limit (Instance entry size)
             const contractDataHardLimit = await getInstanceSize(server, contractId, stateChanges);
-            // D. Historical Read Bytes (Historical storage reads are not metered during simulation; always 0)
+            // Historical read bytes: no size limit in protocol 25 config (fee-only)
             const historicalReadBytes = 0;
             // Limits sourced from live network config (protocol 25, standalone).
             // configSettingContractComputeV0:    txMaxInstructions=100_000_000, txMemoryLimit=41_943_040
@@ -36924,7 +37002,6 @@ async function runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl = RPC_
             // configSettingContractBandwidthV0:  txMaxSizeBytes=132_096
             // configSettingContractEventsV0:     txMaxContractEventsSizeBytes=16_384
             // configSettingContractDataEntrySizeBytes: 65_536
-            // historical_data_read_bytes: no size limit in config (fee-only); tracked as known gap.
             const metrics = {
                 cpu_instructions: { consumed: cpuConsumed, limit: 100_000_000 },
                 memory_bytes: { consumed: memConsumed, limit: 41_943_040 },
@@ -36932,7 +37009,7 @@ async function runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl = RPC_
                 ledger_read_bytes: { consumed: readBytes, limit: 200_000 },
                 ledger_write_entries: { consumed: writeEntries, limit: 50 },
                 ledger_write_bytes: { consumed: writeBytes, limit: 132_096 },
-                historical_data_read_bytes: { consumed: historicalReadBytes, limit: 0 }, // TODO: no size limit in config; fee-only
+                historical_data_read_bytes: { consumed: historicalReadBytes, limit: 0 },
                 contract_data_hard_limit: { consumed: contractDataHardLimit, limit: 65_536 },
                 tx_size_bytes: { consumed: txSizeBytes, limit: 132_096 },
                 events_count: { consumed: eventsCount, limit: 100 },
@@ -36941,12 +37018,13 @@ async function runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl = RPC_
             benchmarks.push({
                 function_name: invokeSpec.function_name,
                 metrics,
+                wasm_sha256: wasmSha256,
             });
         }
         results.push({
             contract_id: contractId,
-            git_commit: gitCommit,
-            soroban_sdk_version: sdkVersion,
+            git_commit: opts.gitCommit,
+            soroban_sdk_version: opts.sdkVersion,
             timestamp: Math.floor(Date.now() / 1000),
             benchmarks,
         });

@@ -1,0 +1,12 @@
+# weighin.toml — threshold configuration for this repo's fixture contract.
+#
+# This file is intentionally permissive during initial development.
+# Tighten rules here once baseline measurements are established.
+
+[thresholds.global]
+fail_on_any_regression = false
+
+# Example per-function rule (uncomment to enforce zero tolerance on writes):
+# [thresholds.functions.hello]
+# ledger_write_entries = "strict_zero_tolerance"
+# ledger_write_bytes   = "strict_zero_tolerance"

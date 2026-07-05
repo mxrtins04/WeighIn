@@ -54,7 +54,12 @@ async function main() {
   console.log(`SDK:      ${sdkVersion}`);
 
   try {
-    const results = await runMeasurement(fixturesPath, gitCommit, sdkVersion, rpcUrl);
+    const results = await runMeasurement({
+      fixturesPath,
+      gitCommit,
+      sdkVersion,
+      rpcUrl,
+    });
     fs.writeFileSync(outputPath, JSON.stringify(results, null, 2), 'utf8');
     console.log(`Done. Results written to ${outputPath}`);
   } catch (error: any) {

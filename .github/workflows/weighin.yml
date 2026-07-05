@@ -1,0 +1,81 @@
+##
+## weighin.yml — Example workflow for a repo that uses the WeighIn action.
+##
+## Copy this file into your repo at .github/workflows/weighin.yml and
+## adjust the inputs to match your project layout.
+##
+## Prerequisites in your repo:
+##   - weighin-fixtures.json  (declares which WASMs to benchmark and which
+##                             functions to invoke)
+##   - rust-toolchain.toml    (pins the Rust channel; must match what you
+##                             use to build the contract in production)
+##   - Optionally: weighin.toml  (threshold rules; omit to run report-only)
+##
+
+name: WeighIn Benchmark
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  benchmark:
+    name: Soroban Resource Benchmark
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write   # post/update the benchmark comment on the PR
+      contents: read
+
+    steps:
+      # 1. Check out the PR head with full history so the action can fetch
+      #    the base branch as a worktree without an extra clone.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. Install the pinned Rust toolchain declared in rust-toolchain.toml.
+      #    The action does not install toolchains; this must come first.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Read from your repo's rust-toolchain.toml, or pin explicitly:
+          toolchain: "1.95.0"
+          targets: wasm32-unknown-unknown
+
+      # 3. Start a local Stellar standalone network.
+      #    stellar/quickstart exposes the Soroban RPC at /rpc on port 8000.
+      #    The container takes ~30 s to become healthy; the polling loop in
+      #    the script below waits up to 120 s before failing.
+      - name: Start local Stellar network
+        run: |
+          docker run --rm -d \
+            --name stellar-quickstart \
+            -p 8000:8000 \
+            stellar/quickstart:latest --local
+
+          echo "Waiting for RPC to become healthy..."
+          for i in $(seq 1 60); do
+            if curl -sf -X POST -H "Content-Type: application/json" \
+                -d '{"jsonrpc":"2.0","id":1,"method":"getNetwork"}' \
+                http://localhost:8000/rpc | grep -q "Standalone Network"; then
+              echo "RPC is healthy."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ERROR: RPC did not become healthy in time." >&2
+          docker logs stellar-quickstart || true
+          exit 1
+
+      # 4. Run the WeighIn action.
+      #    Pin to a specific release tag (e.g. @v1.0.0) in production;
+      #    @main here tracks the latest commit for development.
+      - name: Run WeighIn
+        uses: mxrtins04/WeighIn@main
+        with:
+          fixtures-path: weighin-fixtures.json    # path to your fixtures file
+          config-path: weighin.toml               # omit or leave absent to skip threshold enforcement
+          rpc-url: http://localhost:8000/rpc
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # base-ref: main                        # inferred from PR event; override if needed
