@@ -1,6 +1,6 @@
 # weighin.toml — threshold configuration for this repo's fixture contract.
 #
-# This file is intentionally permissive during initial development.
+# This file is intentionally permissive (no-op test PR) during initial development.
 # Tighten rules here once baseline measurements are established.
 
 [thresholds.global]
