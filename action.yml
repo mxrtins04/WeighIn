@@ -64,4 +64,4 @@ outputs:
 
 runs:
   using: 'node20'
-  main: 'dist/action.js'
+  main: 'bundled/index.js'
