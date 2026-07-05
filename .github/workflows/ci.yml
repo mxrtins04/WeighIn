@@ -28,11 +28,6 @@ jobs:
           toolchain: "1.95.0"
           targets: wasm32-unknown-unknown
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
       - name: Start local Stellar network
         run: bash scripts/start-local-network.sh
 

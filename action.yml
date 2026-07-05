@@ -63,5 +63,5 @@ outputs:
       that want to process the numbers without parsing the PR comment.
 
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'bundled/index.js'
