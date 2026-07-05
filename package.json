@@ -1,0 +1,22 @@
+{
+  "name": "weighin",
+  "version": "1.0.0",
+  "description": "Resource-Cost Benchmarking & CI Regression Toolkit for Soroban",
+  "main": "dist/index.js",
+  "bin": {
+    "weighin": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 0"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "16.0.1",
+    "toml": "3.0.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "typescript": "5.9.3"
+  }
+}

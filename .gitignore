@@ -1,0 +1,16 @@
+# Node
+node_modules/
+dist/
+package-lock.json
+
+# Rust build artifacts
+target/
+contract/target/
+
+# Weighin runtime files
+.weighin-temp-key
+weighin-results.json
+
+# Misc
+*.tar.bz2
+*.tar.gz

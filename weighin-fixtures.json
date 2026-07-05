@@ -1,0 +1,18 @@
+{
+  "contracts": [
+    {
+      "wasm_path": "contract/target/wasm32-unknown-unknown/release/contract_test.wasm",
+      "invocations": [
+        {
+          "function_name": "hello",
+          "args": [
+            {
+              "type": "Symbol",
+              "value": "world"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
